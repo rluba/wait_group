@@ -162,17 +162,20 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
     event_id: User_Event_Id;
 
     #if OS == .LINUX {
-        event_id = eventfd(0, 0);
-        if event_id == -1 {
+        handle := eventfd(0, 0);
+        if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create user event handle: % %", error_code, error_string);
             return false, 0;
         }
 
+
         fd: pollfd;
-        fd.fd = event_id;
+        fd.fd = handle;
         fd.events = POLLIN;
         array_add(*group.poll_fds, fd);
+
+        event_id = cast(User_Event_Id) handle;
     } else {
         #assert(OS == .MACOS); // @Incomplete
         {
@@ -418,6 +421,19 @@ close_and_reset_fd :: (fd: *s32, loc := #caller_location) {
     }
 }
 
+#scope_file
+
+repeat_if_interrupted :: (call: Code) -> s64 #expand {
+    while true {
+        result := #insert call;
+        if result < 0 {
+            error_code := errno();
+            if error_code == EINTR continue; // Got interrupted, try again
+        }
+
+        return result;
+    }
+}
 
 #if OS == .MACOS {
     next_user_event_id_mutex: Mutex;
