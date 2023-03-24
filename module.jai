@@ -206,6 +206,72 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
     return true, event_id;
 }
 
+add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: User_Event_Id, data: *T), timeout_ms: s64, recurring: bool) -> success: bool, User_Event_Id {
+    event_id: User_Event_Id;
+    #if OS == .LINUX {
+        handle := timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if handle == -1 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not create timer event handle: % %", error_code, error_string);
+            return false, 0;
+        }
+
+        timeout_spec: timespec;
+        timeout_spec.tv_sec = timeout_ms / 1000;
+        timeout_spec.tv_nsec = (timeout_ms % 1000) * 1000 * 1000;
+        timer_spec: itimerspec;
+        timer_spec.it_value = timeout_spec;
+        if recurring {
+            timer_spec.it_interval = timeout_spec;
+        }
+
+        result := timerfd_settime(handle, 0, *timer_spec, null);
+        if (result == -1) {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not set timer for timer event handle: % %", error_code, error_string);
+            close(handle);
+            return false, 0;
+        }
+
+        fd: pollfd;
+        fd.fd = handle;
+        fd.events = POLLIN;
+        array_add(*group.poll_fds, fd);
+    } else #if OS == .MACOS {
+        {
+            lock(*next_user_event_id_mutex);
+            defer unlock(*next_user_event_id_mutex);
+            event_id = next_user_event_id;
+            next_user_event_id += 1;
+        }
+
+        flags := Kevent_Flags.ADD;
+        if !recurring flags |= .ONESHOT;
+
+        events: [1] Kevent64;
+        events[0].ident = event_id;
+        events[0].filter = .TIMER;
+        events[0].flags = flags;
+        events[0].data = timeout_ms;
+
+        result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
+        if result == -1 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not register user event % with the event queue: % %", event_id, error_code, error_string);
+            return false, 0;
+        }
+    } else {
+        #assert(false); // Incomplete
+    }
+
+    handler: User_Handler;
+    handler.data = data;
+    handler.callback = xx callback;
+    table_add(*group.user_handlers, event_id, handler);
+
+    return true, event_id;
+}
+
 trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: bool {
     assert(table_find_pointer(*group.user_handlers, event_id) != null, "event_id % is not a user event", event_id);
     #if OS == .LINUX {
@@ -376,7 +442,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
         num_events := kevent64(group.kevent_queue, null, 0, events.data, events.count, 0, timeout_spec_pointer);
         if num_events == -1 {
             error_code := System.get_error_value();
-            if error_code == EINTR || error_code == EAGAIN {
+            if error_code == EINTR {
                 // Got interrupted, try again.
                 return true;
             }
@@ -397,7 +463,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 is_eof := (event.flags & .EOF) != 0;
                 handler := table_find_pointer(*group.fd_handlers, handle);
                 if handler handler.callback(group, handle, is_eof, handler.data);
-            } else if event.filter == .USER {
+            } else if event.filter == .USER || event.filter == .TIMER {
                 event_id := cast(User_Event_Id) event.ident;
                 handler := table_find_pointer(*group.user_handlers, event_id);
                 if handler handler.callback(group, event_id, handler.data);
