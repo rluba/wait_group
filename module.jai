@@ -162,7 +162,7 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
     event_id: User_Event_Id;
 
     #if OS == .LINUX {
-        handle := eventfd(0, 0);
+        handle := eventfd(0, EFD_NONBLOCK);
         if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create user event handle: % %", error_code, error_string);
@@ -209,7 +209,7 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
 add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: User_Event_Id, data: *T), timeout_ms: s64, recurring: bool) -> success: bool, User_Event_Id {
     event_id: User_Event_Id;
     #if OS == .LINUX {
-        handle := timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        handle := timerfd_create(cast(s32) CLOCK_MONOTONIC, TFD_NONBLOCK);
         if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create timer event handle: % %", error_code, error_string);
@@ -219,6 +219,7 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
         timeout_spec: timespec;
         timeout_spec.tv_sec = timeout_ms / 1000;
         timeout_spec.tv_nsec = (timeout_ms % 1000) * 1000 * 1000;
+
         timer_spec: itimerspec;
         timer_spec.it_value = timeout_spec;
         if recurring {
@@ -237,6 +238,8 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
         fd.fd = handle;
         fd.events = POLLIN;
         array_add(*group.poll_fds, fd);
+
+        event_id = cast(User_Event_Id) handle;
     } else #if OS == .MACOS {
         {
             lock(*next_user_event_id_mutex);
@@ -358,6 +361,7 @@ remove_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: b
 
     return true;
 }
+
 #if OS == .LINUX {
     remove_poll_handle :: (group: *Wait_Group, handle: s32) -> success: bool {
         for group.poll_fds {
@@ -398,18 +402,8 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
             signal := table_find_pointer(*group.signals_by_handle, handle);
             if signal {
                 // Clear the signal event by reading the signal info
-                while true {
-                    info: signalfd_siginfo;
-                    bytes_read := repeat_if_interrupted(read(handle, *info, size_of(type_of(info))));
-                    if bytes_read == -1 {
-                        error_value := errno();
-                        if error_value != EAGAIN && error_value != EWOULDBLOCK {
-                            error_string := System.get_error_string(error_value);
-                            log_error("Could not read signal info from handle % for signal %: % %", handle, <<signal, error_value, error_string);
-                            success = false;
-                        }
-                        break;
-                    }
+                if !clear(handle, signalfd_siginfo, "signal info") {
+                    success = false;
                 }
 
                 handler := table_find_pointer(*group.signal_handlers, <<signal);
@@ -418,6 +412,11 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 event_id := cast(User_Event_Id) handle;
                 handler := table_find_pointer(*group.user_handlers, event_id);
                 if handler {
+                    // Clear the user/timer event by reading the counters
+                    if !clear(handle, u64, "event/timer") {
+                        success = false;
+                    }
+
                     handler.callback(group, event_id, handler.data);
                 } else {
                     is_eof := (it.revents & POLLHUP) != 0;
@@ -426,6 +425,24 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 }
             }
         }
+
+        clear :: (handle: s32, $T: Type, description: string) -> bool {
+            while true {
+                info: T;
+                bytes_read := repeat_if_interrupted(read(handle, *info, size_of(type_of(info))));
+                if bytes_read == -1 {
+                    error_value := errno();
+                    if error_value != EAGAIN && error_value != EWOULDBLOCK {
+                        error_string := System.get_error_string(error_value);
+                        log_error("Could not read % from handle %: % %", description, handle, error_value, error_string);
+                        return false;
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
+
     } else {
         #assert(OS == .MACOS);
 
