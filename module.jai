@@ -275,6 +275,46 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
     return true, event_id;
 }
 
+reset_timer :: (group: *Wait_Group, timer: User_Event_Id, timeout_ms: s64, recurring: bool) -> success: bool {
+    #if OS == .LINUX {
+        timeout_spec: timespec;
+        timeout_spec.tv_sec = timeout_ms / 1000;
+        timeout_spec.tv_nsec = (timeout_ms % 1000) * 1000 * 1000;
+
+        timer_spec: itimerspec;
+        timer_spec.it_value = timeout_spec;
+        if recurring {
+            timer_spec.it_interval = timeout_spec;
+        }
+
+        result := timerfd_settime(cast(s32) timer, 0, *timer_spec, null);
+        if (result == -1) {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not set timer for timer event handle: % %", error_code, error_string);
+            return false;
+        }
+    } else #if OS == .MACOS {
+        flags := Kevent_Flags.ADD;
+        if !recurring flags |= .ONESHOT;
+
+        events: [1] Kevent64;
+        events[0].ident = timer;
+        events[0].filter = .TIMER;
+        events[0].flags = flags;
+        events[0].data = timeout_ms;
+
+        result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
+        if result == -1 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not register user event % with the event queue: % %", timer, error_code, error_string);
+            return false;
+        }
+    } else {
+        #assert(false); // Incomplete
+    }
+    return true;
+}
+
 trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: bool {
     assert(table_find_pointer(*group.user_handlers, event_id) != null, "event_id % is not a user event", event_id);
     #if OS == .LINUX {
