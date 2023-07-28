@@ -419,6 +419,23 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
     success := true;
 
     #if OS == .LINUX {
+        clear :: (handle: s32, $T: Type, description: string) -> bool {
+            while true {
+                info: T;
+                bytes_read := repeat_if_interrupted(read(handle, *info, size_of(type_of(info))));
+                if bytes_read == -1 {
+                    error_value := errno();
+                    if error_value != EAGAIN && error_value != EWOULDBLOCK {
+                        error_string := System.get_error_string(error_value);
+                        log_error("Could not read % from handle %: % %", description, handle, error_value, error_string);
+                        return false;
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
+
         poll_timeout_ms := cast(s32) timeout_ms;
         num_events := repeat_if_interrupted(poll(group.poll_fds.data, cast(u64) group.poll_fds.count, poll_timeout_ms));
         if num_events == -1 {
@@ -465,24 +482,6 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 }
             }
         }
-
-        clear :: (handle: s32, $T: Type, description: string) -> bool {
-            while true {
-                info: T;
-                bytes_read := repeat_if_interrupted(read(handle, *info, size_of(type_of(info))));
-                if bytes_read == -1 {
-                    error_value := errno();
-                    if error_value != EAGAIN && error_value != EWOULDBLOCK {
-                        error_string := System.get_error_string(error_value);
-                        log_error("Could not read % from handle %: % %", description, handle, error_value, error_string);
-                        return false;
-                    }
-                    break;
-                }
-            }
-            return true;
-        }
-
     } else {
         #assert(OS == .MACOS);
 
