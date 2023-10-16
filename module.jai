@@ -1,3 +1,4 @@
+// @ToDo: Support waiting for WRITE events, not just READ events!
 Wait_Group :: struct {
     #if OS == .MACOS {
         kevent_queue: s32 = -1;
