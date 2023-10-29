@@ -10,16 +10,33 @@ Wait_Group :: struct {
     }
 
     // @Speed: We could use arrays on Linux and index right into it with the poll_fds index
-    fd_handlers:     Table(s32, Fd_Handler);
+    fd_handlers:     Table(Fd_Data, Fd_Handler, given_compare_function = fd_data_is_equal, given_hash_function = hash_fd_data);
     signal_handlers: Table(s32, Signal_Handler);
     user_handlers:   Table(User_Event_Id, User_Handler);
+
+    Fd_Data :: struct {
+        fd:     s32;
+        event: Wait_Event_Type;
+    }
+
+    fd_data_is_equal :: (a: Fd_Data, b: Fd_Data) -> bool {
+        return a.fd == b.fd && a.event == b.event;
+    }
+    hash_fd_data :: (data: Fd_Data) -> u32 {
+        return Hash.get_hash(data.fd) ^ Hash.get_hash(cast(int) data.event);
+    }
+}
+
+Wait_Event_Type :: enum {
+    READ;
+    WRITE;
 }
 
 User_Event_Id :: #type,isa u64;
 
 Fd_Handler :: struct {
     data: *void;
-    callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, data: *void);
+    callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, event: Wait_Event_Type, data: *void);
 }
 
 Signal_Handler :: struct {
@@ -82,21 +99,27 @@ deinit :: (group: *Wait_Group) {
     group.user_handlers.entries.data = null;
 }
 
-add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, data: *T), handles: .. s32) -> success: bool {
+add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, event: Wait_Event_Type, data: *T), handles: .. s32, event_type := Wait_Event_Type.READ) -> success: bool {
     #if OS == .LINUX {
         array_reserve(*group.poll_fds, group.poll_fds.count + handles.count);
         for handles {
             fd: pollfd;
             fd.fd = it;
-            fd.events = POLLIN;
+            if #complete event_type == {
+                case .READ;  fd.events = POLLIN;
+                case .WRITE; fd.events = POLLOUT;
+            }
             array_add(*group.poll_fds, fd);
         }
     } else {
         events := NewArray(handles.count, Kevent64, allocator = temp);
         for handles {
             events[it_index].ident = cast(u64) it;
-            events[it_index].filter = .READ;
             events[it_index].flags = .ADD;
+            if #complete event_type == {
+                case .READ;  events[it_index].filter = .READ;
+                case .WRITE; events[it_index].filter = .WRITE;
+            }
         }
 
         result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
@@ -111,7 +134,11 @@ add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
     handler.data = data;
     handler.callback = xx callback;
     for handles {
-        table_add(*group.fd_handlers, it, handler);
+        fd_data: Wait_Group.Fd_Data;
+        fd_data.fd = it;
+        fd_data.event = event_type;
+        assert(!table_find_pointer(*group.fd_handlers, fd_data), "Trying to add handle % with event %, but there is already a handler for that!", it, event_type);
+        table_add(*group.fd_handlers, fd_data, handler);
     }
     return true;
 }
@@ -153,6 +180,7 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
     handler.data = data;
     handler.callback = xx callback;
     for signals {
+        assert(!table_find_pointer(*group.signal_handlers, it), "Trying to add signal %, but there is already a handler for that!", it);
         table_add(*group.signal_handlers, it, handler);
     }
 
@@ -346,16 +374,22 @@ trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: 
     return true;
 }
 
-remove_handle :: (group: *Wait_Group, handle: s32) -> success: bool {
-    table_remove(*group.fd_handlers, handle);
+remove_handle :: (group: *Wait_Group, handle: s32, event_type := Wait_Event_Type.READ) -> success: bool {
+    fd_data: Wait_Group.Fd_Data;
+    fd_data.fd = handle;
+    fd_data.event = event_type;
+    table_remove(*group.fd_handlers, fd_data);
 
     #if OS == .LINUX {
-        success := remove_poll_handle(group, handle);
+        success := remove_poll_handle(group, handle, event);
         if !success return false;
     } else {
         events: [1] Kevent64;
         events[0].ident = cast(u64) handle;
-        events[0].filter = .READ;
+        if #complete event_type == {
+            case .READ;  events[0].filter = .READ;
+            case .WRITE; events[0].filter = .WRITE;
+        }
         events[0].flags = .DELETE;
 
         result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
@@ -404,9 +438,14 @@ remove_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: b
 }
 
 #if OS == .LINUX {
-    remove_poll_handle :: (group: *Wait_Group, handle: s32) -> success: bool {
+    remove_poll_handle :: (group: *Wait_Group, handle: s32, event_type: Wait_Event_Type) -> success: bool {
+        events: s16;
+        if #complete event_type == {
+            case .READ;  events = POLLIN;
+            case .WRITE; events = POLLOUT;
+        }
         for group.poll_fds {
-            if it.fd == handle {
+            if it.fd == handle && it.events = events {
                 remove it;
                 return true;
             }
@@ -457,16 +496,20 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 success = false;
             }
 
-            signal := table_find_pointer(*group.signals_by_handle, handle);
-            if signal {
-                // Clear the signal event by reading the signal info
-                if !clear(handle, signalfd_siginfo, "signal info") {
-                    success = false;
+            is_eof := (it.revents & POLLHUP) != 0;
+            if it.revents & POLLIN {
+                signal := table_find_pointer(*group.signals_by_handle, handle);
+                if signal {
+                    // Clear the signal event by reading the signal info
+                    if !clear(handle, signalfd_siginfo, "signal info") {
+                        success = false;
+                    }
+
+                    handler := table_find_pointer(*group.signal_handlers, <<signal);
+                    if handler handler.callback(group, <<signal, handler.data);
+                    continue;
                 }
 
-                handler := table_find_pointer(*group.signal_handlers, <<signal);
-                if handler handler.callback(group, <<signal, handler.data);
-            } else {
                 event_id := cast(User_Event_Id) handle;
                 handler := table_find_pointer(*group.user_handlers, event_id);
                 if handler {
@@ -476,11 +519,23 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                     }
 
                     handler.callback(group, event_id, handler.data);
-                } else {
-                    is_eof := (it.revents & POLLHUP) != 0;
-                    handler := table_find_pointer(*group.fd_handlers, handle);
-                    if handler handler.callback(group, handle, is_eof, handler.data);
+                    continue;
                 }
+
+                fd_data: Wait_Group.Fd_Data;
+                fd_data.fd = handle;
+                fd_data.event = .READ;
+                handler := table_find_pointer(*group.fd_handlers, fd_data);
+                if handler handler.callback(group, handle, is_eof, .READ, handler.data);
+                // Don’t stop here, in case POLLOUT is also set!
+            }
+
+            if it.revents & POLLOUT {
+                fd_data: Wait_Group.Fd_Data;
+                fd_data.fd = handle;
+                fd_data.event = .WRITE;
+                handler := table_find_pointer(*group.fd_handlers, fd_data);
+                if handler handler.callback(group, handle, is_eof, .WRITE, handler.data);
             }
         }
     } else {
@@ -517,9 +572,24 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 if handler handler.callback(group, signal, handler.data);
             } else if event.filter == .READ {
                 handle := cast(s32) event.ident;
-                is_eof := (event.flags & .EOF) != 0;
-                handler := table_find_pointer(*group.fd_handlers, handle);
-                if handler handler.callback(group, handle, is_eof, handler.data);
+                fd_data: Wait_Group.Fd_Data;
+                fd_data.fd = handle;
+                fd_data.event = .READ;
+                handler := table_find_pointer(*group.fd_handlers, fd_data);
+                if handler {
+                    is_eof := (event.flags & .EOF) != 0;
+                    handler.callback(group, handle, is_eof, .READ, handler.data);
+                }
+            } else if event.filter == .WRITE {
+                handle := cast(s32) event.ident;
+                fd_data: Wait_Group.Fd_Data;
+                fd_data.fd = handle;
+                fd_data.event = .WRITE;
+                handler := table_find_pointer(*group.fd_handlers, fd_data);
+                if handler {
+                    is_eof := (event.flags & .EOF) != 0;
+                    handler.callback(group, handle, is_eof, .WRITE, handler.data);
+                }
             } else if event.filter == .USER || event.filter == .TIMER {
                 event_id := cast(User_Event_Id) event.ident;
                 handler := table_find_pointer(*group.user_handlers, event_id);
@@ -587,4 +657,6 @@ repeat_if_interrupted :: (call: Code) -> s64 #expand {
 #import "POSIX";
 #import "Thread";
 System :: #import "System";
+Hash  :: #import "Hash";
+
 
