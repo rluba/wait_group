@@ -63,7 +63,7 @@ main :: () {
     if !success exit(1);
 
     TIMEOUT_MS :: 3_000;
-    success = add_timer(*wait_group, null, on_timeout, TIMEOUT_MS, recurring = false);
+    success=, timer_id := add_timer(*wait_group, null, on_timeout, TIMEOUT_MS, recurring = false);
     if !success exit(1);
 
     while !should_quit {
@@ -74,6 +74,9 @@ main :: () {
             exit(1);
         }
     }
+
+    success = remove_timer(*wait_group, timer_id);
+    if !success exit(1);
 }
 
 handle_ready_to_write :: (group: *Wait_Group, handle: s32, is_eof: bool, event: Wait_Event_Type, stuff: *Stuff) {

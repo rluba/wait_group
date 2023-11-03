@@ -1,5 +1,6 @@
 // @ToDo: Support waiting for WRITE events, not just READ events!
 Wait_Group :: struct {
+    verbose: bool;
     #if OS == .MACOS {
         kevent_queue: s32 = -1;
     } else #if OS == .LINUX {
@@ -50,7 +51,8 @@ User_Handler :: struct {
 }
 
 
-init :: (group: *Wait_Group) -> success: bool {
+init :: (group: *Wait_Group, verbose := false) -> success: bool {
+    group.verbose = verbose;
     remember_allocators(*group.fd_handlers);
     remember_allocators(*group.signal_handlers);
     remember_allocators(*group.user_handlers);
@@ -100,6 +102,7 @@ deinit :: (group: *Wait_Group) {
 }
 
 add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, event: Wait_Event_Type, data: *T), handles: .. s32, event_type := Wait_Event_Type.READ) -> success: bool {
+    if group.verbose log("Adding handles % for event type %", handles, event_type);
     #if OS == .LINUX {
         array_reserve(*group.poll_fds, group.poll_fds.count + handles.count);
         for handles {
@@ -144,6 +147,7 @@ add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
 }
 
 add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, signal: s32, data: *T), signals: ..s32) -> success: bool {
+    if group.verbose log("Adding signals %", signals);
     #if OS == .LINUX {
         array_reserve(*group.poll_fds, group.poll_fds.count + signals.count);
         for signals {
@@ -227,6 +231,7 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
         }
     }
 
+    if group.verbose log("Adding user event %", event_id);
     handler: User_Handler;
     handler.data = data;
     handler.callback = xx callback;
@@ -296,6 +301,7 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
         #assert(false); // Incomplete
     }
 
+    if group.verbose log("Adding %ms timer (recurring: %) as user event %", timeout_ms, recurring, event_id);
     handler: User_Handler;
     handler.data = data;
     handler.callback = xx callback;
@@ -305,6 +311,7 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
 }
 
 reset_timer :: (group: *Wait_Group, timer: User_Event_Id, timeout_ms: s64, recurring: bool) -> success: bool {
+    if group.verbose log("Resetting timer % for %ms (recurring: %)", timer, timeout_ms, recurring);
     #if OS == .LINUX {
         timeout_spec: timespec;
         timeout_spec.tv_sec = timeout_ms / 1000;
@@ -345,6 +352,7 @@ reset_timer :: (group: *Wait_Group, timer: User_Event_Id, timeout_ms: s64, recur
 }
 
 trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: bool {
+    if group.verbose log("Triggering user event %", event_id);
     assert(table_find_pointer(*group.user_handlers, event_id) != null, "event_id % is not a user event", event_id);
     #if OS == .LINUX {
         value: u64 = 1;
@@ -375,6 +383,8 @@ trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: 
 }
 
 remove_handle :: (group: *Wait_Group, handle: s32, event_type := Wait_Event_Type.READ) -> success: bool {
+    if group.verbose log("Removing handle % for event type %", handle, event_type);
+
     fd_data: Wait_Group.Fd_Data;
     fd_data.fd = handle;
     fd_data.event = event_type;
@@ -406,39 +416,16 @@ remove_handle :: (group: *Wait_Group, handle: s32, event_type := Wait_Event_Type
 // @ToDo: remove_signal
 
 remove_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: bool {
-    found := table_remove(*group.user_handlers, event_id);
-    assert(found, "Could not find user event %", event_id);
+    return remove_user_event_or_timer(group, event_id, is_timer = false);
+}
 
-    #if OS == .LINUX {
-        handle := cast(s32) event_id;
-        result := close(handle);
-        if result == -1 {
-            error_code, error_string := System.get_error_value_and_string();
-            log_error("Could not close user event %: % %", event_id, error_code, error_string);
-            return false;
-        }
-
-        success := remove_poll_handle(group, handle);
-        if !success return false;
-    } else {
-        events: [1] Kevent64;
-        events[0].ident = event_id;
-        events[0].filter = .USER;
-        events[0].flags = .DELETE;
-
-        result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
-        if result == -1 {
-            error_code, error_string := System.get_error_value_and_string();
-            log_error("Could not remove user event % from the event queue: % %", event_id, error_code, error_string);
-            return false;
-        }
-    }
-
-    return true;
+remove_timer :: (group: *Wait_Group, timer_id: User_Event_Id) -> success: bool {
+    return remove_user_event_or_timer(group, timer_id, is_timer = true);
 }
 
 #if OS == .LINUX {
     remove_poll_handle :: (group: *Wait_Group, handle: s32, event_type: Wait_Event_Type) -> success: bool {
+        if group.verbose log("Removing poll handle", handle);
         events: s16;
         if #complete event_type == {
             case .READ;  events = POLLIN;
@@ -628,6 +615,50 @@ repeat_if_interrupted :: (call: Code) -> s64 #expand {
     }
 }
 
+
+remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_timer: bool) -> success: bool {
+    #if is_timer {
+        NAME :: "timer";
+    } else {
+        NAME :: "user event";
+    }
+    if group.verbose log("Removing % %", NAME, event_id);
+
+    found := table_remove(*group.user_handlers, event_id);
+    assert(found, "Could not find % %", NAME, event_id);
+
+    #if OS == .LINUX {
+        handle := cast(s32) event_id;
+        result := close(handle);
+        if result == -1 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not close % %: % %", NAME, event_id, error_code, error_string);
+            return false;
+        }
+
+        success := remove_poll_handle(group, handle);
+        if !success return false;
+    } else {
+        events: [1] Kevent64;
+        events[0].ident = event_id;
+        events[0].flags = .DELETE;
+        #if is_timer {
+            events[0].filter = .TIMER;
+        } else {
+            events[0].filter = .USER;
+        }
+
+        result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
+        if result == -1 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not remove % % from the event queue: % %", NAME, event_id, error_code, error_string);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 #if OS == .MACOS {
     next_user_event_id_mutex: Mutex;
     next_user_event_id: User_Event_Id;
@@ -645,6 +676,8 @@ repeat_if_interrupted :: (call: Code) -> s64 #expand {
             log_error("Could not create signal handle for signal %: % %", signal, error_code, error_string);
             return -1, false;
         }
+
+        if group.verbose log("Created signal handle % for signal %", handle, signal);
 
         return handle, true;
     }
