@@ -157,6 +157,8 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
                 return false;
             }
 
+            if group.verbose log("Created signal handle % for signal %", handle, signal);
+
             table_add(*group.signals_by_handle, handle, it);
 
             fd: pollfd;
@@ -391,7 +393,7 @@ remove_handle :: (group: *Wait_Group, handle: s32, event_type := Wait_Event_Type
     table_remove(*group.fd_handlers, fd_data);
 
     #if OS == .LINUX {
-        success := remove_poll_handle(group, handle, event);
+        success := remove_poll_handle(group, handle, event_type);
         if !success return false;
     } else {
         events: [1] Kevent64;
@@ -425,14 +427,14 @@ remove_timer :: (group: *Wait_Group, timer_id: User_Event_Id) -> success: bool {
 
 #if OS == .LINUX {
     remove_poll_handle :: (group: *Wait_Group, handle: s32, event_type: Wait_Event_Type) -> success: bool {
-        if group.verbose log("Removing poll handle", handle);
+        if group.verbose log("Removing poll handle %", handle);
         events: s16;
         if #complete event_type == {
             case .READ;  events = POLLIN;
             case .WRITE; events = POLLOUT;
         }
         for group.poll_fds {
-            if it.fd == handle && it.events = events {
+            if it.fd == handle && it.events == events {
                 remove it;
                 return true;
             }
@@ -497,24 +499,28 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                     continue;
                 }
 
-                event_id := cast(User_Event_Id) handle;
-                handler := table_find_pointer(*group.user_handlers, event_id);
-                if handler {
-                    // Clear the user/timer event by reading the counters
-                    if !clear(handle, u64, "event/timer") {
-                        success = false;
-                    }
+                {
+                    event_id := cast(User_Event_Id) handle;
+                    handler := table_find_pointer(*group.user_handlers, event_id);
+                    if handler {
+                        // Clear the user/timer event by reading the counters
+                        if !clear(handle, u64, "event/timer") {
+                            success = false;
+                        }
 
-                    handler.callback(group, event_id, handler.data);
-                    continue;
+                        handler.callback(group, event_id, handler.data);
+                        continue;
+                    }
                 }
 
-                fd_data: Wait_Group.Fd_Data;
-                fd_data.fd = handle;
-                fd_data.event = .READ;
-                handler := table_find_pointer(*group.fd_handlers, fd_data);
-                if handler handler.callback(group, handle, is_eof, .READ, handler.data);
-                // Don’t stop here, in case POLLOUT is also set!
+                {
+                    fd_data: Wait_Group.Fd_Data;
+                    fd_data.fd = handle;
+                    fd_data.event = .READ;
+                    handler := table_find_pointer(*group.fd_handlers, fd_data);
+                    if handler handler.callback(group, handle, is_eof, .READ, handler.data);
+                    // Don’t stop here, in case POLLOUT is also set!
+                }
             }
 
             if it.revents & POLLOUT {
@@ -636,7 +642,7 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
             return false;
         }
 
-        success := remove_poll_handle(group, handle);
+        success := remove_poll_handle(group, handle, .READ);
         if !success return false;
     } else {
         events: [1] Kevent64;
@@ -684,8 +690,6 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
             log_error("Could not create signal handle for signal %: % %", signal, error_code, error_string);
             return -1, false;
         }
-
-        if group.verbose log("Created signal handle % for signal %", handle, signal);
 
         return handle, true;
     }
