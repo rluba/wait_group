@@ -650,7 +650,15 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
 
         result := kevent64(group.kevent_queue, events.data, cast (s32) events.count, null, 0, 0, null);
         if result == -1 {
-            error_code, error_string := System.get_error_value_and_string();
+            error_code := System.get_error_value();
+            #if is_timer {
+                if error_code == ENOENT {
+                    // ONESHOT timers are automatically removed, so if the timer has already fired,
+                    // we will get this error if we then try to remove it.
+                    return true;
+                }
+            }
+            error_string := System.get_error_string(error_code);
             log_error("Could not remove % % from the event queue: % %", NAME, event_id, error_code, error_string);
             return false;
         }
