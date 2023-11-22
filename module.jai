@@ -4,13 +4,12 @@ Wait_Group :: struct {
     #if OS == .MACOS {
         kevent_queue: s32 = -1;
     } else #if OS == .LINUX {
-        poll_fds: [..] pollfd;
+        epoll_handle: s32 = -1;
         signals_by_handle: Table(s32, s32); // Map from handle to signal
     } else {
         #assert(false);
     }
 
-    // @Speed: We could use arrays on Linux and index right into it with the poll_fds index
     fd_handlers:     Table(Fd_Data, Fd_Handler, given_compare_function = fd_data_is_equal, given_hash_function = hash_fd_data);
     signal_handlers: Table(s32, Signal_Handler);
     user_handlers:   Table(User_Event_Id, User_Handler);
@@ -58,7 +57,13 @@ init :: (group: *Wait_Group, verbose := false) -> success: bool {
     remember_allocators(*group.user_handlers);
 
     #if OS == .LINUX {
-        remember_allocators(*group.poll_fds);
+        group.epoll_handle = epoll_create1(EPOLL_CLOEXEC);
+        if group.epoll_handle < 0 {
+            error_code, error_string := System.get_error_value_and_string();
+            log_error("Could not create epoll instance: % %", error_code, error_string);
+            return false;
+        }
+
         remember_allocators(*group.signals_by_handle);
     } else #if OS == .MACOS {
         // @ToDo: This initialization itself is not thread safe
@@ -81,8 +86,7 @@ init :: (group: *Wait_Group, verbose := false) -> success: bool {
 
 deinit :: (group: *Wait_Group) {
     #if OS == .LINUX {
-        array_free(group.poll_fds);
-        group.poll_fds.data = null;
+        close_and_reset_fd(*group.epoll_handle);
         for signal, handle: group.signals_by_handle {
             close(handle);
         }
@@ -104,15 +108,26 @@ deinit :: (group: *Wait_Group) {
 add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: s32, is_eof: bool, event: Wait_Event_Type, data: *T), handles: .. s32, event_type := Wait_Event_Type.READ) -> success: bool {
     if group.verbose log("Adding handles % for event type %", handles, event_type);
     #if OS == .LINUX {
-        array_reserve(*group.poll_fds, group.poll_fds.count + handles.count);
         for handles {
-            fd: pollfd;
-            fd.fd = it;
+            action := Epoll_Ctl.ADD;
+            events: u32;
             if #complete event_type == {
-                case .READ;  fd.events = POLLIN;
-                case .WRITE; fd.events = POLLOUT;
+                case .READ;  events = EPOLLRDHUP | EPOLLIN;
+                case .WRITE; events = EPOLLOUT;
             }
-            array_add(*group.poll_fds, fd);
+            for fd_handler, fd_data: group.fd_handlers {
+                if fd_data.fd == it {
+                    assert(fd_data.event != event_type, "Trying to add handle % with event %, but there is already a handler for that!", it, event_type);
+                    action = .MOD;
+                    if #complete fd_data.event == {
+                        case .READ;  events |= EPOLLRDHUP | EPOLLIN;
+                        case .WRITE; events |= EPOLLOUT;
+                    }
+                }
+            }
+
+            success := update_epoll_handle(group, it, action, events);
+            if !success return false;
         }
     } else {
         events := NewArray(handles.count, Kevent64, allocator = temp);
@@ -149,7 +164,6 @@ add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
 add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, signal: s32, data: *T), signals: ..s32) -> success: bool {
     if group.verbose log("Adding signals %", signals);
     #if OS == .LINUX {
-        array_reserve(*group.poll_fds, group.poll_fds.count + signals.count);
         for signals {
             handle, success := create_signal_handle(it);
             if !success {
@@ -161,10 +175,8 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
 
             table_add(*group.signals_by_handle, handle, it);
 
-            fd: pollfd;
-            fd.fd = handle;
-            fd.events = POLLIN;
-            array_add(*group.poll_fds, fd);
+            success = update_epoll_handle(group, handle, .ADD, EPOLLIN, description = "signal handle");
+            if !success return false;
         }
     } else {
         #assert(OS == .MACOS); // @Incomplete
@@ -204,11 +216,8 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
             return false, 0;
         }
 
-
-        fd: pollfd;
-        fd.fd = handle;
-        fd.events = POLLIN;
-        array_add(*group.poll_fds, fd);
+        success := update_epoll_handle(group, handle, .ADD, EPOLLIN, description = "user event handle");
+        if !success return false, 0;
 
         event_id = cast(User_Event_Id) handle;
     } else {
@@ -270,10 +279,8 @@ add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group
             return false, 0;
         }
 
-        fd: pollfd;
-        fd.fd = handle;
-        fd.events = POLLIN;
-        array_add(*group.poll_fds, fd);
+        success := update_epoll_handle(group, handle, .ADD, EPOLLIN, description = "timer event handle");
+        if !success return false, 0;
 
         event_id = cast(User_Event_Id) handle;
     } else #if OS == .MACOS {
@@ -393,7 +400,20 @@ remove_handle :: (group: *Wait_Group, handle: s32, event_type := Wait_Event_Type
     table_remove(*group.fd_handlers, fd_data);
 
     #if OS == .LINUX {
-        success := remove_poll_handle(group, handle, event_type);
+        action := Epoll_Ctl.DEL;
+        events: u32;
+        for fd_handler, fd_data: group.fd_handlers {
+            if fd_data.fd == handle {
+                assert(fd_data.event != event_type, "Trying to remove handle % with event %, but there is more than one handler for that!", handle, event_type);
+                action = .MOD;
+                if #complete fd_data.event == {
+                    case .READ;  events |= EPOLLRDHUP | EPOLLIN;
+                    case .WRITE; events |= EPOLLOUT;
+                }
+            }
+        }
+
+        success := update_epoll_handle(group, handle, action, events);
         if !success return false;
     } else {
         events: [1] Kevent64;
@@ -426,21 +446,25 @@ remove_timer :: (group: *Wait_Group, timer_id: User_Event_Id) -> success: bool {
 }
 
 #if OS == .LINUX {
-    remove_poll_handle :: (group: *Wait_Group, handle: s32, event_type: Wait_Event_Type) -> success: bool {
-        if group.verbose log("Removing poll handle %", handle);
-        events: s16;
-        if #complete event_type == {
-            case .READ;  events = POLLIN;
-            case .WRITE; events = POLLOUT;
-        }
-        for group.poll_fds {
-            if it.fd == handle && it.events == events {
-                remove it;
+    update_epoll_handle :: (group: *Wait_Group, handle: s32, action: Epoll_Ctl, events: u32, description := "handle") -> success: bool {
+        eev: epoll_event;
+        eev.data.fd = handle;
+        eev.events = events;
+
+        result := epoll_ctl(group.epoll_handle, action, handle, *eev);
+        if result == -1 {
+            error_code := System.get_error_value();
+            if error_code == EBADF && action == .DEL {
+                // handle was probably already closed and therefore auto-removed from epoll.
                 return true;
             }
+
+            error_string := System.get_error_string(error_code);
+            log_error("Could not perform epoll % on % %: % %", action, description, handle, error_code, error_string);
+            return false;
         }
-        log_error("Could not find handle % to remove it from the watch group.", handle);
-        return false;
+
+        return true;
     }
 }
 
@@ -466,29 +490,35 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
         }
 
         poll_timeout_ms := cast(s32) timeout_ms;
-        num_events := repeat_if_interrupted(poll(group.poll_fds.data, cast(u64) group.poll_fds.count, poll_timeout_ms));
+        events: [16] epoll_event;
+
+        sigset: sigset_t;
+        sigemptyset(*sigset);
+        sigaddset(*sigset, SIGCHLD);  // default: ignore
+        sigaddset(*sigset, SIGCONT);  // default: continue execution
+        sigaddset(*sigset, SIGURG);   // default: ignore
+        sigaddset(*sigset, SIGWINCH); // default: ignore
+
+        num_events := repeat_if_interrupted(epoll_wait(group.epoll_handle, events.data, events.count, poll_timeout_ms));
         if num_events == -1 {
             error_value, error_string := System.get_error_value_and_string();
             log_error("Couldn't poll events: % %", error_value, error_string);
             return false;
         }
 
-        poll_fds := group.poll_fds; // Make a copy in case someone modifies this in a callback while we’re iterating
-
         if group.verbose log("Wait: % events", num_events);
-        for i: 0..poll_fds.count-1 {
-            it := poll_fds[i];
-            handle := it.fd;
-            if !it.revents continue;
-            if group.verbose log("Event: %", it);
+        for i: 0..num_events-1 {
+            it := events[i];
+            handle := it.data.fd;
+            if group.verbose log("Event: %, %", handle, it.events);
 
-            if it.revents & POLLNVAL {
-                log_error("Handle % reported invalid value: %", handle, it);
+            if it.events & EPOLLNVAL {
+                log_error("Handle % reported invalid value: %", handle, it.events);
                 success = false;
             }
 
-            is_eof := (it.revents & POLLHUP) != 0;
-            if it.revents & POLLIN || is_eof {
+            is_eof := (it.events & EPOLLHUP) != 0;
+            if it.events & EPOLLIN || is_eof {
                 signal := table_find_pointer(*group.signals_by_handle, handle);
                 if signal {
                     // Clear the signal event by reading the signal info
@@ -525,7 +555,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 }
             }
 
-            if it.revents & POLLOUT || is_eof {
+            if it.events & EPOLLOUT || is_eof {
                 fd_data: Wait_Group.Fd_Data;
                 fd_data.fd = handle;
                 fd_data.event = .WRITE;
@@ -643,9 +673,6 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
             log_error("Could not close % %: % %", NAME, event_id, error_code, error_string);
             return false;
         }
-
-        success := remove_poll_handle(group, handle, .READ);
-        if !success return false;
     } else {
         events: [1] Kevent64;
         events[0].ident = event_id;
