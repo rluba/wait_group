@@ -6,13 +6,13 @@ Stuff :: struct {
 }
 
 should_quit: bool;
-DATA_SIZE :: 10240;
+DATA_SIZE :: 102400;
 write_stuff: Stuff;
 read_stuff:  Stuff;
 
 main :: () {
     wait_group: Wait_Group;
-    success := init(*wait_group);
+    success := init(*wait_group, verbose = true);
     if !success  exit(1);
 
     // Create a new socketpair to forward accepts from this socket to the cluster instance:
@@ -110,6 +110,8 @@ handle_ready_to_write :: (group: *Wait_Group, handle: s32, is_eof: bool, event: 
         if !remaining {
             log("Finished writing all data. Closing socket.");
             close(handle);
+            // On linux, you need to remove the handle if you close it or you will receive a POLLNVAL next time you try to poll
+            remove_handle(group, handle, event_type =. WRITE);
         }
     }
 }
@@ -152,7 +154,7 @@ handle_ready_to_read :: (group: *Wait_Group, handle: s32, is_eof: bool, event: W
 
     if is_eof {
         assert(!remaining);
-        log("Received EOF. Qutting.");
+        log("Received EOF. Quitting.");
         should_quit = true;
     }
 }
