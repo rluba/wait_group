@@ -475,10 +475,12 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
 
         poll_fds := group.poll_fds; // Make a copy in case someone modifies this in a callback while we’re iterating
 
+        if group.verbose log("Wait: % events", num_events);
         for i: 0..poll_fds.count-1 {
             it := poll_fds[i];
             handle := it.fd;
             if !it.revents continue;
+            if group.verbose log("Event: %", it);
 
             if it.revents & POLLNVAL {
                 log_error("Handle % reported invalid value: %", handle, it);
@@ -486,7 +488,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
             }
 
             is_eof := (it.revents & POLLHUP) != 0;
-            if it.revents & POLLIN {
+            if it.revents & POLLIN || is_eof {
                 signal := table_find_pointer(*group.signals_by_handle, handle);
                 if signal {
                     // Clear the signal event by reading the signal info
@@ -523,7 +525,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 }
             }
 
-            if it.revents & POLLOUT {
+            if it.revents & POLLOUT || is_eof {
                 fd_data: Wait_Group.Fd_Data;
                 fd_data.fd = handle;
                 fd_data.event = .WRITE;
