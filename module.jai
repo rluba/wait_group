@@ -130,7 +130,7 @@ add_handles :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
             if !success return false;
         }
     } else {
-        events := NewArray(handles.count, Kevent64, allocator = temp);
+        events := NewArray(handles.count, Kevent64,, temp);
         for handles {
             events[it_index].ident = cast(u64) it;
             events[it_index].flags = .ADD;
@@ -180,7 +180,7 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
         }
     } else {
         #assert(OS == .MACOS); // @Incomplete
-        events := NewArray(signals.count, Kevent64, allocator = temp);
+        events := NewArray(signals.count, Kevent64,, temp);
         for signals {
             events[it_index].ident = cast(u64) it;
             events[it_index].filter = .SIGNAL;
