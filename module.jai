@@ -1,4 +1,3 @@
-// @ToDo: Support waiting for WRITE events, not just READ events!
 Wait_Group :: struct {
     verbose: bool;
     #if OS == .MACOS {

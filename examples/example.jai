@@ -70,7 +70,7 @@ main :: () {
         success := wait_for_events(*wait_group);
         if !success {
             error_code, error_string := get_error_value_and_string();
-            log_error("Couldn’t wait for events. Exiting…");
+            log_error("Couldn’t wait for events: % %. Exiting…", error_code, error_string);
             exit(1);
         }
     }
