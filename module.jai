@@ -208,7 +208,7 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
     event_id: User_Event_Id;
 
     #if OS == .LINUX {
-        handle := eventfd(0, EFD_NONBLOCK);
+        handle := eventfd(0, xx EFD.NONBLOCK);
         if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create user event handle: % %", error_code, error_string);
@@ -253,7 +253,7 @@ add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_
 add_timer :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, handle: User_Event_Id, data: *T), timeout_ms: s64, recurring: bool) -> success: bool, User_Event_Id {
     event_id: User_Event_Id;
     #if OS == .LINUX {
-        handle := timerfd_create(cast(s32) CLOCK_MONOTONIC, TFD_NONBLOCK);
+        handle := timerfd_create(xx clockid_t.MONOTONIC, xx TFD.NONBLOCK);
         if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create timer event handle: % %", error_code, error_string);
@@ -712,7 +712,7 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
         sigemptyset(*sig_mask);
         sigaddset(*sig_mask, signal);
 
-        handle := signalfd(-1, *sig_mask, SFD_NONBLOCK);
+        handle := signalfd(-1, *sig_mask, xx SFD.NONBLOCK);
         if handle == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not create signal handle for signal %: % %", signal, error_code, error_string);
@@ -721,6 +721,8 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
 
         return handle, true;
     }
+
+    #import "Linux";
 } else #if OS == .MACOS {
     #import "macos";
 }
