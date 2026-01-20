@@ -204,7 +204,7 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
     return true;
 }
 
-add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, event_id: User_Event_Id, data: *T)) -> success: bool, event_id: User_Event_Id #must {
+add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, event_id: User_Event_Id, data: *T)) -> success: bool, event_id: User_Event_Id {
     event_id: User_Event_Id;
 
     #if OS == .LINUX {
@@ -525,8 +525,8 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                         success = false;
                     }
 
-                    handler := table_find_pointer(*group.signal_handlers, <<signal);
-                    if handler handler.callback(group, <<signal, handler.data);
+                    handler := table_find_pointer(*group.signal_handlers, signal.*);
+                    if handler handler.callback(group, signal.*, handler.data);
                     continue;
                 }
 
@@ -628,13 +628,13 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
 #scope_module
 
 close_and_reset_fd :: (fd: *s32, loc := #caller_location) {
-    if <<fd != -1 {
-        result := close(<<fd);
+    if fd.* != -1 {
+        result := close(fd.*);
         if result == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("%: %,%: Could not close file descriptor %: % %", loc.fully_pathed_filename, loc.line_number, loc.character_number, fd, error_code, error_string);
         }
-        <<fd = -1;
+        fd.* = -1;
     }
 }
 
