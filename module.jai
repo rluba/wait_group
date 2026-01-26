@@ -204,7 +204,7 @@ add_signals :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Gro
     return true;
 }
 
-add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, event_id: User_Event_Id, data: *T)) -> success: bool, event_id: User_Event_Id #must {
+add_user_event :: (group: *Wait_Group, data: *$T, callback: #type (group: *Wait_Group, event_id: User_Event_Id, data: *T)) -> success: bool, event_id: User_Event_Id {
     event_id: User_Event_Id;
 
     #if OS == .LINUX {
