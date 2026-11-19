@@ -516,8 +516,11 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                 success = false;
             }
 
-            is_eof := (it.events & EPOLLHUP) != 0;
-            if it.events & EPOLLIN || is_eof {
+            is_hangup := (it.events & EPOLLHUP) != 0;
+            // EPOLLRDHUP: The peer closed its writing end. That’s EOF for reading (like EV_EOF on macOS),
+            // but we can still write to it.
+            is_read_eof := is_hangup || (it.events & EPOLLRDHUP) != 0;
+            if it.events & EPOLLIN || is_read_eof {
                 signal := table_find_pointer(*group.signals_by_handle, handle);
                 if signal {
                     // Clear the signal event by reading the signal info
@@ -549,17 +552,17 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
                     fd_data.fd = handle;
                     fd_data.event = .READ;
                     handler := table_find_pointer(*group.fd_handlers, fd_data);
-                    if handler handler.callback(group, handle, is_eof, .READ, handler.data);
+                    if handler handler.callback(group, handle, is_read_eof, .READ, handler.data);
                     // Don’t stop here, in case POLLOUT is also set!
                 }
             }
 
-            if it.events & EPOLLOUT || is_eof {
+            if it.events & EPOLLOUT || is_hangup {
                 fd_data: Wait_Group.Fd_Data;
                 fd_data.fd = handle;
                 fd_data.event = .WRITE;
                 handler := table_find_pointer(*group.fd_handlers, fd_data);
-                if handler handler.callback(group, handle, is_eof, .WRITE, handler.data);
+                if handler handler.callback(group, handle, is_hangup, .WRITE, handler.data);
             }
         }
     } else {
